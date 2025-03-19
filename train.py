@@ -658,7 +658,11 @@ if __name__ == '__main__':
             if epoch is None:
                 break
 
-        saver.process_step(step)
+        should_quit = saver.process_step(step)
+        if should_quit:
+            saved = True
+            checkpointed = True
+            break
         step += 1
 
     # Save final training state checkpoint and model, unless we just saved them.

@@ -140,6 +140,7 @@ class Saver:
                 return None, checkpointed, saved
             if is_main_process():
                 print(f'Started new epoch: {epoch}')
+
         return epoch, checkpointed, saved
 
     def process_step(self, step):
@@ -148,6 +149,7 @@ class Saver:
         should_manually_quit = False
         save_signal_file = self.save_root / 'save'
         save_quit_signal_file = self.save_root / 'save_quit'
+
         if save_signal_file.exists() and save_signal_file.is_file():
             should_manually_save = True
             dist.barrier()
@@ -160,13 +162,20 @@ class Saver:
             if is_main_process():
                 os.remove(save_quit_signal_file)
 
-        # TODO: support save_every_n_steps in addition to save_every_n_epochs. Maybe only one should be set?
-        # if step % self.config['save_every_n_steps'] == 0 or should_manually_save:
-        #     self.save_model(f'step{step}')
+        num_steps = self.config.get("num_steps", None)
+        save_steps = self.config.get("save_every_n_steps", None)
+
+        if isinstance(num_steps, int) and step > num_steps:
+            print(f"Stopping training at user-requested step of {num_steps}")
+            should_manually_save = True
+            should_manually_quit = True
+        elif isinstance(save_steps, int) and step % save_steps == 0:
+            should_manually_save = True
+
+        if should_manually_save:
+            self.save_model(f'step{step}')
 
         if need_to_checkpoint(self.config) or should_manually_save:
             self.save_checkpoint(step)
 
-        if should_manually_quit:
-            print('Manually quitting')
-            sys.exit()
+        return should_manually_quit
