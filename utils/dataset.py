@@ -295,6 +295,7 @@ class DirectoryDataset:
         caption_files = []
         mask_files = []
         for file in files:
+            print("file", file)
             if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz':
                 continue
             image_file = file
@@ -399,17 +400,17 @@ class DirectoryDataset:
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
                     # 100% accurate frame count, but much slower.
-                    # frames = 0
-                    # for frame in imageio.v3.imiter(image_file):
-                    #     frames += 1
-                    #     height, width = frame.shape[:2]
+                    frames = 0
+                    for frame in imageio.v3.imiter(image_file):
+                        frames += 1
+                        height, width = frame.shape[:2]
                     # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
                     # it still close enough?
-                    meta = imageio.v3.immeta(image_file)
-                    first_frame = next(imageio.v3.imiter(image_file))
-                    height, width = first_frame.shape[:2]
-                    assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
-                    frames = int(self.framerate * meta['duration'])
+                    # meta = imageio.v3.immeta(image_file)
+                    # first_frame = next(imageio.v3.imiter(image_file))
+                    # height, width = first_frame.shape[:2]
+                    # assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
+                    # frames = int(self.framerate * meta['duration'])
                 else:
                     pil_img = Image.open(image_file)
                     width, height = pil_img.size
@@ -512,6 +513,7 @@ class DirectoryDataset:
         print(f'caching latents: {self.path}')
         datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets:
+            print("ds", ds.path)
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
@@ -556,6 +558,7 @@ class Dataset:
         datasets_by_size_bucket = defaultdict(list)
         for directory_dataset in self.directory_datasets:
             for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
+                print("size_bucket_dataset", size_bucket_dataset.size_bucket)
                 datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
@@ -636,6 +639,7 @@ class Dataset:
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
+            print("ds", ds.path)
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
