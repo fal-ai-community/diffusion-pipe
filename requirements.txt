@@ -26,3 +26,4 @@ termcolor
 hydra-core
 easydict
 ftfy
+pytorch-optimizer

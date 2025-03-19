@@ -53,7 +53,7 @@ path = '/home/anon/data/images/grayscale'
 
 # How many repeats for 1 epoch. The dataset will act like it is duplicated this many times.
 # The semantics of this are the same as sd-scripts: num_repeats=1 means one epoch is a single pass over all examples (no duplication).
-num_repeats = 10
+num_repeats = 1
 
 # Example of overriding some settings, and using ar_buckets to directly specify ARs.
 # ar_buckets = [[448, 576]]
