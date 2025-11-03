@@ -2,6 +2,7 @@ import math
 from typing import List, Tuple
 import sys
 import os.path
+import re
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules'))
 
 import diffusers
@@ -65,7 +66,19 @@ class Lumina2Pipeline(BasePipeline):
                 qk_norm=True,
                 cap_feat_dim=cap_feat_dim,
             )
-        state_dict = load_state_dict(self.model_config['transformer_path'])
+
+        state_dict = {}
+        with safetensors.safe_open(self.model_config['transformer_path'], framework="pt", device="cpu") as f:
+            if 'model.diffusion_model.x_embedder.weight' in f.keys():
+                # Checkpoint format. Also contains VAE and text encoder.
+                for k in f.keys():
+                    if not k.startswith('model.diffusion_model.'):
+                        continue
+                    state_dict[re.sub(r'model\.diffusion_model\.', '', k)] = f.get_tensor(k)
+            else:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+
         for name, param in self.transformer.named_parameters():
             set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype, value=state_dict[name])
 

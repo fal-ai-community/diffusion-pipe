@@ -1,6 +1,7 @@
 import math
 import os.path
 from functools import partial
+from pathlib import Path
 
 import diffusers
 import torch
@@ -12,7 +13,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
-from utils.common import AUTOCAST_DTYPE, is_main_process
+from utils.common import AUTOCAST_DTYPE, is_main_process, load_state_dict
 from utils.offloading import ModelOffloader
 
 NUM_DOUBLE_BLOCKS = 19
@@ -75,7 +76,15 @@ BFL_TO_DIFFUSERS_MAP = {
 }
 
 
-KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'time_text_embed', 'context_embedder', 'x_embedder']
+KEEP_IN_HIGH_PRECISION = ['time_text_embed', 'context_embedder', 'x_embedder']
+
+
+def vae_encode(vae, image):
+    latents = vae.encode(image.to(vae.device, vae.dtype)).latent_dist.sample()
+    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
+        latents = latents - vae.config.shift_factor
+    latents = latents * vae.config.scaling_factor
+    return latents
 
 
 def make_diffusers_to_bfl_map(num_double_blocks: int = NUM_DOUBLE_BLOCKS, num_single_blocks: int = NUM_SINGLE_BLOCKS) -> dict[str, tuple[int, str]]:
@@ -180,11 +189,20 @@ class FluxPipeline(BasePipeline):
                 print('Bypassing Flux guidance')
             bypass_flux_guidance(transformer)
 
+        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
+
+        if 'adapter' in self.config:
+            if fuse_adapters := self.config['adapter'].get('fuse_adapters', None):
+                print(f'Fusing adapters: {fuse_adapters}')
+                for fuse_adapter in fuse_adapters:
+                    self.load_adapter_weights(fuse_adapter['path'], fuse=True, fuse_weight=fuse_adapter.get('weight', 1.0))
+                    self.unload_lora_weights()
+
         for name, p in transformer.named_parameters():
-            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION) or name.startswith('proj_out')):
+            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION) or name.startswith('proj_out') or name.startswith('norm_out') or p.ndim == 1):
                 p.data = p.data.to(transformer_dtype)
 
-        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
+        self.is_flex2 = (self.transformer.x_embedder.weight.size(1) == 196)
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
@@ -201,12 +219,38 @@ class FluxPipeline(BasePipeline):
     def get_text_encoders(self):
         return [self.text_encoder, self.text_encoder_2]
 
+    def configure_adapter(self, adapter_config):
+        if 'init_from_existing' in adapter_config:
+            # For this model, load_adapter_weights() both creates the LoRA and loads its weights.
+            return
+
+        return super().configure_adapter(adapter_config)
+
     def save_adapter(self, save_dir, peft_state_dict):
         adapter_type = self.config['adapter']['type']
         if adapter_type == 'lora':
             self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+
+    def load_adapter_weights(self, adapter_path, fuse=False, fuse_weight=1.0):
+        print(f'Loading adapter weights from path {adapter_path}')
+        if adapter_path.endswith('.safetensors'):
+            safetensors_file = adapter_path
+        else:
+            safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+            if len(safetensors_files) == 0:
+                raise RuntimeError(f'No safetensors file found in {adapter_path}')
+            if len(safetensors_files) > 1:
+                raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+            safetensors_file = safetensors_files[0]
+        adapter_state_dict = load_state_dict(safetensors_file)
+        self.diffusers_pipeline.load_lora_weights(adapter_state_dict, adapter_name='default')
+        for name, p in self.transformer.named_parameters():
+            p.original_name = name
+
+        if fuse:
+            self.fuse_lora(lora_scale=fuse_weight)
 
     def save_model(self, save_dir, diffusers_sd):
         diffusers_to_bfl_map = make_diffusers_to_bfl_map()
@@ -244,12 +288,18 @@ class FluxPipeline(BasePipeline):
         save_file(flux_sd, save_dir / 'model.safetensors', metadata={"format": "pt"})
 
     def get_call_vae_fn(self, vae):
-        def fn(tensor):
-            latents = vae.encode(tensor.to(vae.device, vae.dtype)).latent_dist.sample()
-            if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
-                latents = latents - vae.config.shift_factor
-            latents = latents * vae.config.scaling_factor
-            return {'latents': latents}
+        def fn(*args):
+            if len(args) == 1:
+                tensor = args[0]
+                latents = vae_encode(vae, tensor)
+                return {'latents': latents}
+            elif len(args) == 2:
+                tensor, control_tensor = args
+                latents = vae_encode(vae, tensor)
+                control_latents = vae_encode(vae, control_tensor)
+                return {'latents': latents, 'control_latents': control_latents}
+            else:
+                raise RuntimeError(f'Unexpected number of args: {len(args)}')
         return fn
 
     def get_call_text_encoder_fn(self, text_encoder):
@@ -276,10 +326,9 @@ class FluxPipeline(BasePipeline):
 
         # The following code taken and slightly modified from x-flux (https://github.com/XLabs-AI/x-flux/tree/main)
         bs, c, h, w = latents.shape
-        latents = rearrange(latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
+            mask = mask.unsqueeze(1).expand((-1, c, -1, -1))  # make mask (bs, c, img_h, img_w)
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = rearrange(mask, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
@@ -316,23 +365,37 @@ class FluxPipeline(BasePipeline):
 
         x_1 = latents
         x_0 = torch.randn_like(x_1)
-        t_expanded = t.view(-1, 1, 1)
+        t_expanded = t.view(-1, 1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
         guidance_vec = torch.full((x_t.shape[0],), float(self.model_config['guidance']), device=x_t.device, dtype=torch.float32)
 
-        features = (x_t, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec), (target, mask)
+        if self.is_flex2:
+            x_t = F.pad(x_t, (0, 0, 0, 0, 0, 33))
+        x_t = rearrange(x_t, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        target = rearrange(target, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        img_seq_len = torch.tensor(x_t.shape[1], device=x_t.device).repeat((bs,))
 
-        # We pass the target through the layers of the model in the features tuple, so that it matches the noisy input when we get to the
-        # last pipeline parallel stage.
-        return features
+        if 'control_latents' in inputs:
+            control_latents = inputs['control_latents'].float()
+            assert control_latents.shape == latents.shape
+            control_img_ids = self._prepare_latent_image_ids(bs, h // 2, w // 2, control_latents.device, control_latents.dtype)
+            # image ids are the same as latent ids with the first dimension set to 1 instead of 0
+            control_img_ids[..., 0] = 1
+            if control_img_ids.ndim == 2:
+                # This method must return tensors with batch dimension, since we proceed to split along batch dimension for pipelining.
+                control_img_ids = control_img_ids.unsqueeze(0).repeat((bs, 1, 1))
+            img_ids = torch.cat([img_ids, control_img_ids], dim=1)
+            control_latents = rearrange(control_latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+            x_t = torch.cat([x_t, control_latents], dim=1)
+
+        return (x_t, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec, img_seq_len), (target, mask)
 
     def to_layers(self):
         transformer = self.transformer
         layers = [EmbeddingWrapper(transformer.x_embedder, transformer.time_text_embed, transformer.context_embedder, transformer.pos_embed)]
         for i, block in enumerate(transformer.transformer_blocks):
             layers.append(TransformerWrapper(block, i, self.offloader_double))
-        layers.append(concatenate_hidden_states)
         for i, block in enumerate(transformer.single_transformer_blocks):
             layers.append(SingleTransformerWrapper(block, i, self.offloader_single))
         layers.append(OutputWrapper(transformer.norm_out, transformer.proj_out))
@@ -403,7 +466,7 @@ class EmbeddingWrapper(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance = inputs
+        hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, img_seq_len = inputs
         hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(hidden_states.dtype) * 1000
         guidance = guidance.to(hidden_states.dtype) * 1000
@@ -419,7 +482,7 @@ class EmbeddingWrapper(nn.Module):
             img_ids = img_ids[0]
         ids = torch.cat((txt_ids, img_ids), dim=0)
         freqs_cos, freqs_sin = self.pos_embed(ids)
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len)
 
 
 class TransformerWrapper(nn.Module):
@@ -431,7 +494,7 @@ class TransformerWrapper(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len = inputs
 
         self.offloader.wait_for_block(self.block_idx)
         encoder_hidden_states, hidden_states = self.block(
@@ -442,13 +505,7 @@ class TransformerWrapper(nn.Module):
         )
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin)
-
-
-def concatenate_hidden_states(inputs):
-    hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
-    hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-    return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len)
 
 
 class SingleTransformerWrapper(nn.Module):
@@ -460,17 +517,18 @@ class SingleTransformerWrapper(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        hidden_states = self.block(
+        encoder_hidden_states, hidden_states = self.block(
             hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
             temb=temb,
             image_rotary_emb=(freqs_cos, freqs_sin),
         )
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len)
 
 
 class OutputWrapper(nn.Module):
@@ -481,7 +539,8 @@ class OutputWrapper(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
-        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, img_seq_len = inputs
+        img_seq_len = img_seq_len[0].item()
+        hidden_states = hidden_states[:, :img_seq_len, ...]
         hidden_states = self.norm_out(hidden_states, temb)
         return self.proj_out(hidden_states)

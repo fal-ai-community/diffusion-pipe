@@ -1,20 +1,31 @@
+from pathlib import Path
 import os.path
+import sys
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/LTX_Video'))
 
+import random
 import safetensors
 import torch
 from torch import nn
 import torch.nn.functional as F
-from diffusers import LTXPipeline, LTXVideoTransformer3DModel, AutoencoderKLLTXVideo
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
+from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline as OriginalLTXVideoPipeline
+from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
+from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
+from ltx_video.models.transformers.transformer3d import Transformer3DModel
+from ltx_video.models.autoencoders.vae_encode import vae_encode
+
+
+KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'scale_shift_table', 'patchify_proj', 'proj_out', 'adaln_single', 'caption_projection']
 
 
 class LTXVideoPipeline(BasePipeline):
     name = 'ltx-video'
     framerate = 25
     checkpointable_layers = ['TransformerLayer']
-    adapter_target_modules = ['LTXTransformerBlock', 'LTXVideoTransformerBlock']
+    adapter_target_modules = ['BasicTransformerBlock']
 
     def __init__(self, config):
         self.config = config
@@ -22,21 +33,41 @@ class LTXVideoPipeline(BasePipeline):
         dtype = self.model_config['dtype']
 
         diffusers_path = self.model_config['diffusers_path']
-        kwargs = {}
-        if single_file_path := self.model_config.get('single_file_path', None):
-            print(f'Loading transformer and VAE from {single_file_path}')
-            kwargs['transformer'] = LTXVideoTransformer3DModel.from_single_file(single_file_path, torch_dtype=dtype)
-            kwargs['vae'] = AutoencoderKLLTXVideo.from_single_file(single_file_path, torch_dtype=dtype)
-        self.diffusers_pipeline = LTXPipeline.from_pretrained(diffusers_path, torch_dtype=dtype, **kwargs)
+        single_file_path = Path(self.model_config['single_file_path'])
 
-        self.transformer.train()
-        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
-        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
-        for name, p in self.transformer.named_parameters():
-            p.original_name = name
+        # The VAE could be different for each model version, so we have to make sure to use different cache directories.
+        self.name = single_file_path.stem
+
+        vae = CausalVideoAutoencoder.from_pretrained(single_file_path)
+        self.diffusers_pipeline = OriginalLTXVideoPipeline.from_pretrained(
+            diffusers_path,
+            transformer=None,
+            vae=vae,
+            patchifier=SymmetricPatchifier(patch_size=1),
+            prompt_enhancer_image_caption_model=None,
+            prompt_enhancer_image_caption_processor=None,
+            prompt_enhancer_llm_model=None,
+            prompt_enhancer_llm_tokenizer=None,
+            torch_dtype=dtype,
+        )
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
+
+    def load_diffusion_model(self):
+        single_file_path = self.model_config['single_file_path']
+        dtype = self.model_config['dtype']
+        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
+
+        transformer = Transformer3DModel.from_pretrained(single_file_path, torch_dtype=dtype)
+        for name, p in transformer.named_parameters():
+            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
+                p.data = p.data.to(transformer_dtype)
+
+        transformer.train()
+        for name, p in transformer.named_parameters():
+            p.original_name = name
+        self.diffusers_pipeline.transformer = transformer
 
     def get_vae(self):
         return self.vae
@@ -65,8 +96,11 @@ class LTXVideoPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            latents = vae.encode(tensor.to(vae.device, vae.dtype)).latent_dist.sample()
-            latents = self._normalize_latents(latents, self.vae.latents_mean, self.vae.latents_std)
+            latents = vae_encode(
+                tensor.to(dtype=vae.dtype, device=vae.device),
+                vae,
+                vae_per_channel_normalize=True,
+            )
             return {'latents': latents}
         return fn
 
@@ -89,16 +123,26 @@ class LTXVideoPipeline(BasePipeline):
         mask = inputs['mask']
 
         bs, channels, num_frames, height, width = latents.shape
-        latents = self._pack_latents(
-            latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+
+        temporal_downscale = self.vae.temporal_downscale_factor
+        spatial_downscale = self.vae.spatial_downscale_factor
+        latents, pixel_coords, conditioning_mask, num_cond_latents = (
+            self.prepare_conditioning(
+                conditioning_items=[],
+                init_latents=latents,
+                num_frames=(num_frames-1)*temporal_downscale + 1,
+                height=height*spatial_downscale,
+                width=width*spatial_downscale,
+                vae_per_channel_normalize=True,
+            )
         )
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
+            # untested
+            mask = mask.unsqueeze(1).unsqueeze(1).expand((-1, channels, num_frames, -1, -1))  # make mask (bs, c, f, img_h, img_w)
             mask = F.interpolate(mask, size=(height, width), mode='nearest-exact')  # resize to latent spatial dimension
-            mask = mask.unsqueeze(2)  # make mask same number of dims as target
-            mask = self._pack_latents(
-                mask, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+            mask, _ = self.patchifier.patchify(
+                latents=mask
             )
 
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
@@ -123,20 +167,29 @@ class LTXVideoPipeline(BasePipeline):
         x_1 = latents
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1)
+
+        # Copied and modified from https://github.com/Lightricks/LTX-Video-Trainer/blob/main/src/ltxv_trainer/trainer.py
+        if mask is None:
+            mask = torch.ones_like(x_1)
+        first_frame_conditioning_p = self.model_config.get('first_frame_conditioning_p', 0)
+        # If first frame conditioning is enabled, the first latent (first video frame) is left (almost) unchanged.
+        if first_frame_conditioning_p and random.random() < first_frame_conditioning_p:
+            t_expanded = t_expanded.repeat(1, x_1.shape[1], 1)
+            first_frame_end_idx = height * width
+
+            # if we only have one frame (e.g. when training on still images),
+            # skip this step otherwise we have no target to train on.
+            if first_frame_end_idx < x_1.shape[1]:
+                t_expanded[:, :first_frame_end_idx] = 1e-5  # Small sigma close to 0 for the first frame.
+                mask[:, :first_frame_end_idx] = 0.0  # Mask out the loss for the first frame.
+
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
 
-        # Timesteps passed to model need to be in range [0, 1000]
-        t = t * 1000
+        fractional_coords = pixel_coords.to(torch.float32)
+        fractional_coords[:, 0] = fractional_coords[:, 0] * (1.0 / self.framerate)
 
-        num_frames = torch.full((bs,), num_frames)
-        height = torch.full((bs,), height)
-        width = torch.full((bs,), width)
-        latent_frame_rate = self.framerate / self.vae_temporal_compression_ratio
-        rope_interpolation_scale_time = torch.full((bs,), 1 / latent_frame_rate)
-        rope_interpolation_scale_space = torch.full((bs,), self.vae_spatial_compression_ratio)
-
-        return (x_t, prompt_embeds, prompt_attention_mask, t, num_frames, height, width, rope_interpolation_scale_time, rope_interpolation_scale_space), (target, mask)
+        return (x_t, prompt_embeds, prompt_attention_mask, t, fractional_coords), (target, mask)
 
     def to_layers(self):
         transformer = self.transformer
@@ -146,53 +199,75 @@ class LTXVideoPipeline(BasePipeline):
         layers.append(OutputLayer(transformer))
         return layers
 
+    def get_loss_fn(self):
+        def loss_fn(output, label):
+            target, mask = label
+            with torch.autocast('cuda', enabled=False):
+                output = output.to(torch.float32)
+                target = target.to(output.device, torch.float32)
+                loss = F.mse_loss(output, target, reduction='none')
+                # empty tensor means no masking
+                if mask.numel() > 0:
+                    mask = mask.to(output.device, torch.float32)
+                    # Copied and modified from https://github.com/Lightricks/LTX-Video-Trainer/blob/main/src/ltxv_trainer/trainer.py
+                    loss = loss.mul(mask).div(mask.mean())   # divide by mean to keep the loss scale unchanged.
+                loss = loss.mean()
+            return loss
+        return loss_fn
+
+
 
 class InitialLayer(nn.Module):
     def __init__(self, transformer):
         super().__init__()
-        # Prevent registering the whole Transformer.
         self.transformer = [transformer]
-        # Explicitly register these modules.
-        self.rope = self.transformer[0].rope
-        self.proj_in = self.transformer[0].proj_in
-        self.time_embed = self.transformer[0].time_embed
-        self.caption_projection = self.transformer[0].caption_projection
+        self.patchify_proj = transformer.patchify_proj
+        self.timestep_scale_multiplier = transformer.timestep_scale_multiplier
+        self.adaln_single = transformer.adaln_single
+        self.caption_projection = transformer.caption_projection
+
+    def __getattr__(self, name):
+        return getattr(self.transformer[0], name)
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, encoder_attention_mask, timestep, num_frames, height, width, rope_interpolation_scale_time, rope_interpolation_scale_space = inputs
-
-        rope_interpolation_scale = (
-            rope_interpolation_scale_time[0].item(),
-            rope_interpolation_scale_space[0].item(),
-            rope_interpolation_scale_space[0].item(),
-        )
-        num_frames = num_frames[0].item()
-        height = height[0].item()
-        width = width[0].item()
-        freqs_cos, freqs_sin = self.rope(hidden_states, num_frames, height, width, rope_interpolation_scale)
+        (hidden_states, encoder_hidden_states, encoder_attention_mask, timestep, indices_grid) = inputs
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = (
+                1 - encoder_attention_mask.to(hidden_states.dtype)
+            ) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        batch_size = hidden_states.size(0)
-        hidden_states = self.proj_in(hidden_states)
+        hidden_states = self.patchify_proj(hidden_states)
 
-        temb, embedded_timestep = self.time_embed(
+        if self.timestep_scale_multiplier:
+            timestep = self.timestep_scale_multiplier * timestep
+
+        freqs_cos, freqs_sin = self.precompute_freqs_cis(indices_grid)
+
+        batch_size = hidden_states.shape[0]
+        timestep, embedded_timestep = self.adaln_single(
             timestep.flatten(),
+            {"resolution": None, "aspect_ratio": None},
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
+        # Second dimension is 1 or number of tokens (if timestep_per_token)
+        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
+        embedded_timestep = embedded_timestep.view(
+            batch_size, -1, embedded_timestep.shape[-1]
+        )
 
-        temb = temb.view(batch_size, -1, temb.size(-1))
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+        if self.caption_projection is not None:
+            batch_size = hidden_states.shape[0]
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(
+                batch_size, -1, hidden_states.shape[-1]
+            )
 
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
-
-        outputs = make_contiguous(hidden_states, encoder_hidden_states, temb, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask)
+        outputs = make_contiguous(hidden_states, encoder_hidden_states, timestep, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask)
         for tensor in outputs:
             if torch.is_floating_point(tensor):
                 tensor.requires_grad_(True)
@@ -206,34 +281,34 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask = inputs
+        hidden_states, encoder_hidden_states, timestep, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask = inputs
         hidden_states = self.block(
-            hidden_states=hidden_states,
+            hidden_states,
+            freqs_cis=(freqs_cos, freqs_sin),
+            attention_mask=None,
             encoder_hidden_states=encoder_hidden_states,
-            temb=temb,
-            image_rotary_emb=(freqs_cos, freqs_sin),
             encoder_attention_mask=encoder_attention_mask,
+            timestep=timestep,
         )
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask)
+        return make_contiguous(hidden_states, encoder_hidden_states, timestep, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask)
 
 
 class OutputLayer(nn.Module):
     def __init__(self, transformer):
         super().__init__()
-        # Prevent registering the whole Transformer.
         self.transformer = [transformer]
-        # Explicitly register these modules.
-        self.scale_shift_table = self.transformer[0].scale_shift_table
-        self.norm_out = self.transformer[0].norm_out
-        self.proj_out = self.transformer[0].proj_out
+        self.scale_shift_table = transformer.scale_shift_table
+        self.norm_out = transformer.norm_out
+        self.proj_out = transformer.proj_out
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask = inputs
+        hidden_states, encoder_hidden_states, timestep, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask = inputs
 
-        scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        scale_shift_values = (
+            self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
         return self.proj_out(hidden_states)

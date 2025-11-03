@@ -201,8 +201,6 @@ class CosmosPipeline(BasePipeline):
             self.config,
             support_video=True,
             framerate=self.framerate,
-            round_height=8,
-            round_width=8,
             round_frames=8,
         )
 

@@ -1,0 +1,7 @@
+pipeline_stages = 1
+
+[model]
+type = 'wan'
+# Edit ckpt_path to point to the Wan model you downloaded.
+ckpt_path = '/data2/imagegen_models/Wan2.1-T2V-1.3B'
+dtype = 'bfloat16'

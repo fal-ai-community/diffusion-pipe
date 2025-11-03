@@ -4,7 +4,7 @@ import bitsandbytes.functional as F
 
 
 class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
-    def __init__(self, *args, stabilize=True, **kwargs):
+    def __init__(self, *args, stabilize=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.stabilize = stabilize
 

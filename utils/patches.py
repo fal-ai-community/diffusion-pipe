@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import torch
 from torch import nn
+import torch._inductor.runtime.triton_heuristics
 import peft
 from peft.tuners._buffer_dict import BufferDict
 from transformers import CLIPTextModel, AutoModel
@@ -15,7 +16,13 @@ from deepspeed.runtime.pipe.schedule import (
 )
 from deepspeed import comm as dist
 from deepspeed.utils import groups
+try:
+    from torch._six import inf
+except ModuleNotFoundError:
+    from torch import inf
+from deepspeed.accelerator import get_accelerator
 
+from . import reduction
 import hyvideo.text_encoder
 from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
@@ -161,6 +168,128 @@ def broadcast_model(self):
                 p.data = p.data.to(orig_device)
 
 
+def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
+    """Clips gradient norm of an iterable of parameters.
+
+    This has been adapted from Nvidia megatron. We add norm averaging
+    to consider MoE params when calculating norm as they will result
+    in different norms across different ranks.
+
+    This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
+    added functionality to handle model parallel parameters. Note that
+    the gradients are modified in place.
+
+    Arguments:
+        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will have gradients normalized
+        max_norm (float or int): max norm of the gradients
+        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        Total norm of the parameters (viewed as a single vector).
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    norm_type = float(norm_type)
+    all_norms = []
+    if norm_type == inf:
+        for p in parameters:
+            all_norms.append(p.grad.data.abs().max().float())
+        total_norm = torch.stack(all_norms).max()
+        total_norm = total_norm.to(get_accelerator().current_device_name())
+        # Take max across all GPUs.
+        if mpu is not None:
+            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
+    else:
+        total_norm = 0
+        for p in parameters:
+            if mpu is not None:
+                if (mpu.get_model_parallel_rank() == 0) or deepspeed.runtime.utils.is_model_parallel_parameter(p):
+                    param_norm = p.grad.data.detach().float().norm(norm_type)
+                    all_norms.append(param_norm)
+            else:
+                param_norm = p.grad.data.detach().float().norm(norm_type)
+                all_norms.append(param_norm)
+        if len(all_norms) > 0:
+            total_norm = torch.stack(all_norms).square().sum().float()
+        else:
+            total_norm = get_accelerator().FloatTensor([0.0])
+        total_norm = total_norm.to(get_accelerator().current_device_name())
+        # Sum across all model parallel GPUs.
+        if mpu is not None:
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+        total_norm = total_norm.pow(1. / norm_type)
+
+    # Need to average total_norm across different GPUs due to the presence of moe params
+    pg = groups._get_data_parallel_group()
+    scaled_norm = total_norm * 1.0 / float(dist.get_world_size(group=pg))
+    scaled_norm_tensor = scaled_norm
+
+    dist.all_reduce(scaled_norm_tensor, group=pg)
+    total_norm = scaled_norm_tensor
+    # Change this from the original Deepspeed code.
+    if len(parameters) > 0:
+        total_norm = total_norm.to(parameters[0].device)
+
+    max_norm = torch.tensor([float(max_norm)], device=total_norm.device)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    tmp_tensor = torch.tensor([1.0], device=clip_coef.device)
+    clip_coef = torch.min(tmp_tensor, clip_coef)
+    for p in parameters:
+        p.grad.data.mul_(clip_coef)
+    return total_norm
+
+
+def copy_args_to_cpu_if_needed(self, *args, **kwargs):
+    """
+    To support benchmarking in the presence of mutated args, we need to avoid
+    autotuning contanminating them. We try to pass cloned args to the kernel.
+    If those clones would increase the peak memory usage, however, we instead
+    copy to cpu and restore them after each iteration. Figure out the args
+    to be copied and do the copying.
+    """
+    if not self.optimize_mem:
+        return {}
+
+    copies = {}
+    budget = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
+
+    def maybe_copy(name, arg):
+        if name in self.mutated_arg_names and arg.is_cuda:
+            nonlocal budget
+            assert isinstance(arg, torch.Tensor)
+            required_storage_length = torch._prims_common.compute_required_storage_length(
+                arg.size(),
+                arg.stride(),
+                0,
+            )
+            size = required_storage_length * arg.element_size()
+            if size > budget:
+                cpu_arg = torch.empty_strided(
+                    (required_storage_length,),
+                    (1,),
+                    dtype=arg.dtype,
+                    device="cpu",
+                )
+                cpu_arg.copy_(
+                    arg.as_strided((required_storage_length,), (1,)),
+                    non_blocking=True,
+                )
+                copies[name] = (arg, cpu_arg)
+            else:
+                budget -= size
+
+    for name, arg in zip(self.fn.arg_names, args):
+        maybe_copy(name, arg)
+
+    for name, arg in kwargs.items():
+        maybe_copy(name, arg)
+
+    return copies
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -180,3 +309,12 @@ def apply_patches():
     # 2. We skip broadcasting for parameters that don't require grad. These weights are static and always the same because
     #    they were loaded from disk, so we can safely skip broadcasting and it's faster.
     deepspeed.runtime.engine.DeepSpeedEngine._broadcast_model = broadcast_model
+
+    # Don't fail if there are no trainable parameters on a stage.
+    deepspeed.runtime.engine.DeepSpeedEngine.clip_fp32_gradients = lambda self: clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
+
+    # Efficiently send Tensors across Queues and Pipes when using the third-party multiprocess library.
+    reduction.init_reductions()
+
+    # Remove pin_memory=True which is causing failures in some cases when using torch compile.
+    torch._inductor.runtime.triton_heuristics.CachingAutotuner.copy_args_to_cpu_if_needed = copy_args_to_cpu_if_needed

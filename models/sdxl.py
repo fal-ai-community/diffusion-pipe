@@ -387,6 +387,10 @@ class SDXLPipeline(BasePipeline):
             torch_dtype=self.model_config['dtype'],
             add_watermarker=False,
         )
+        # The two tokenizers should be the same. After all, the two sets of text embeddings are concatenated token-by-token.
+        # But in rare cases, the token count can differ (I've only seen off by 1), and this causes a failure. So work around it
+        # by forcing the tokenizers to be the same object.
+        self.diffusers_pipeline.tokenizer_2 = self.diffusers_pipeline.tokenizer
         self.diffusers_pipeline.scheduler = diffusers.DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
         )
@@ -424,6 +428,10 @@ class SDXLPipeline(BasePipeline):
         return []
 
     def configure_adapter(self, adapter_config):
+        if 'init_from_existing' in adapter_config:
+            # For this model, load_adapter_weights() both creates the LoRA and loads its weights.
+            return
+
         # Target all linear layers in the main blocks.
         self._add_adapter(adapter_config, self.unet, [self.unet.down_blocks, self.unet.mid_block, self.unet.up_blocks], state_dict_key_prefix='unet.')
         # Target all linear layers in the text encoder.
@@ -575,7 +583,7 @@ class SDXLPipeline(BasePipeline):
             truncation=False,
             add_special_tokens=False,
             return_tensors="pt",
-        ).input_ids
+        ).input_ids.to(torch.int64)
         return input_ids
 
     def to_layers(self):
@@ -602,15 +610,21 @@ class SDXLPipeline(BasePipeline):
                 text_encoder_2_params.append(p)
             else:
                 raise RuntimeError(f'Unexpected parameter: {p.original_name}')
-        base_lr = self.config['optimizer']['lr']
+        base_lr = self.config['optimizer'].get('lr', None)
         unet_lr = self.model_config.get('unet_lr', base_lr)
         text_encoder_lr = self.model_config.get('text_encoder_1_lr', base_lr)
         text_encoder_2_lr = self.model_config.get('text_encoder_2_lr', base_lr)
         if is_main_process():
             print(f'Using unet_lr={unet_lr}, text_encoder_1_lr={text_encoder_lr}, text_encoder_2_lr={text_encoder_2_lr}')
-        unet_param_group = {'params': unet_params, 'lr': unet_lr}
-        text_encoder_param_group = {'params': text_encoder_params, 'lr': text_encoder_lr}
-        text_encoder_2_param_group = {'params': text_encoder_2_params, 'lr': text_encoder_2_lr}
+        unet_param_group = {'params': unet_params}
+        if unet_lr is not None:
+            unet_param_group['lr'] = unet_lr
+        text_encoder_param_group = {'params': text_encoder_params}
+        if text_encoder_lr is not None:
+            text_encoder_param_group['lr'] = text_encoder_lr
+        text_encoder_2_param_group = {'params': text_encoder_2_params}
+        if text_encoder_2_lr is not None:
+            text_encoder_2_param_group['lr'] = text_encoder_2_lr
         return [unet_param_group, text_encoder_param_group, text_encoder_2_param_group]
 
     def get_loss_fn(self):

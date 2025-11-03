@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from safetensors.torch import save_file
 from accelerate import init_empty_weights
+import peft
 
 from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, load_state_dict
@@ -150,12 +151,18 @@ class ChromaPipeline(BasePipeline):
         with init_empty_weights():
             transformer = Chroma(chroma_params)
         transformer.load_state_dict(load_state_dict(self.model_config['transformer_path']), assign=True)
+        self.diffusers_pipeline.transformer = transformer
+
+        if 'adapter' in self.config:
+            if fuse_adapters := self.config['adapter'].get('fuse_adapters', None):
+                print(f'Fusing adapters: {fuse_adapters}')
+                for fuse_adapter in fuse_adapters:
+                    self.load_and_fuse_adapter(fuse_adapter['path'])
 
         for name, p in transformer.named_parameters():
             if not any(x in name for x in KEEP_IN_HIGH_PRECISION):
                 p.data = p.data.to(transformer_dtype)
 
-        self.diffusers_pipeline.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
@@ -206,7 +213,8 @@ class ChromaPipeline(BasePipeline):
                     "The following part of your input was truncated because `max_sequence_length` is set to "
                     f" {max_sequence_length} tokens: {removed_text}"
                 )
-            prompt_embeds = self.text_encoder_2(text_input_ids.to(text_encoder.device), output_hidden_states=False)[0]
+            device = text_encoder.device
+            prompt_embeds = self.text_encoder_2(text_input_ids.to(device), text_inputs.attention_mask.to(device), output_hidden_states=False)[0]
             return {'t5_embed': prompt_embeds, 't5_attention_mask': text_inputs.attention_mask}
         return fn
 
@@ -221,7 +229,7 @@ class ChromaPipeline(BasePipeline):
         latents = rearrange(latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
+            mask = mask.unsqueeze(1).expand((-1, c, -1, -1))  # make mask (bs, c, img_h, img_w)
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = rearrange(mask, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
@@ -368,7 +376,9 @@ class InitialLayer(nn.Module):
             )
             # then and only then we could concatenate it together
             input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1)
-            mod_vectors = self.distilled_guidance_layer(input_vec.requires_grad_(True))
+            mod_vectors = self.distilled_guidance_layer(input_vec)
+        # Need to force this to True for Deepspeed pipeline parallelism.
+        mod_vectors.requires_grad_(True)
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
@@ -410,6 +420,17 @@ class TransformerWrapper(nn.Module):
 
         self.offloader.wait_for_block(self.idx)
 
+        double_mod = self._get_mods(mod_vectors)
+        img, txt = self.block(
+            img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
+        )
+
+        self.offloader.submit_move_blocks_forward(self.idx)
+
+        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+
+    @torch.compiler.disable
+    def _get_mods(self, mod_vectors):
         img_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.img_mod.lin"]
         txt_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.txt_mod.lin"]
         img_mod = [
@@ -428,14 +449,7 @@ class TransformerWrapper(nn.Module):
             )
             for spec in txt_mod_spec
         ]
-        double_mod = [img_mod, txt_mod]
-        img, txt = self.block(
-            img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
-        )
-
-        self.offloader.submit_move_blocks_forward(self.idx)
-
-        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        return [img_mod, txt_mod]
 
 
 def concatenate_hidden_states(inputs):
@@ -457,17 +471,22 @@ class SingleTransformerWrapper(nn.Module):
 
         self.offloader.wait_for_block(self.idx)
 
+        single_mod = self._get_mods(mod_vectors)
+        img = self.block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
+
+        self.offloader.submit_move_blocks_forward(self.idx)
+
+        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+
+    @torch.compiler.disable
+    def _get_mods(self, mod_vectors):
         single_mod_spec = modulation_distribute_dict[f"single_blocks.{self.idx}.modulation.lin"]
         single_mod = ModulationOut(
             shift=mod_vectors[:, single_mod_spec.shift, :],
             scale=mod_vectors[:, single_mod_spec.scale, :],
             gate=mod_vectors[:, single_mod_spec.gate, :],
         )
-        img = self.block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
-
-        self.offloader.submit_move_blocks_forward(self.idx)
-
-        return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
+        return single_mod
 
 
 class FinalLayer(nn.Module):
