@@ -115,7 +115,7 @@ class Saver:
         else:
             self.save_full_model(name)
 
-    def save_checkpoint(self, step, examples):
+    def save_checkpoint(self, step, examples=None):
         self.model_engine.save_checkpoint(
             self.save_root,
             client_state={
@@ -144,7 +144,7 @@ class Saver:
 
         return epoch, checkpointed, saved
 
-    def process_step(self, step, examples):
+    def process_step(self, step, examples=None):
         checkpointed, saved = False, False
         # Look at some simple "signal files" the user can write to save and optionally quit manually
         should_manually_save = False
@@ -178,6 +178,6 @@ class Saver:
             self.save_model(f'step{step}')
 
         if need_to_checkpoint(self.config):
-            self.save_checkpoint(step)
+            self.save_checkpoint(step, examples)
 
         return should_manually_quit
