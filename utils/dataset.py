@@ -4,6 +4,7 @@ import random
 from collections import defaultdict
 import math
 import os
+import time
 import hashlib
 import json
 import tarfile
@@ -440,7 +441,16 @@ class DirectoryDataset:
         for grouping_key in unique_grouping_keys:
             grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}'
             print(f'Loading grouped metadata with grouping key {grouping_key}')
-            metadata = datasets.load_from_disk(str(grouped_cache_dir))
+            metadata = None
+            for num_attempts in range(5):
+                try:
+                    metadata = datasets.load_from_disk(str(grouped_cache_dir))
+                    break
+                except Exception as e:
+                    print(f'Error loading grouped metadata (attempt {num_attempts + 1}): {e}')
+                    time.sleep(num_attempts * 2)
+            if metadata is None:
+                raise RuntimeError(f'Failed to load grouped metadata after 5 attempts: {e}')
             if self.use_size_buckets:
                 assert len(grouping_key) == 3
                 self.size_bucket_datasets.append(
